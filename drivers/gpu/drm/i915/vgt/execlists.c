@@ -783,7 +783,7 @@ static void vgt_el_create_shadow_context(struct vgt_device *vgt,
 		el_ctx->shadow_entry_backup[i].pdev = vgt->pdev;
 		el_ctx->shadow_entry_backup[i].type = GTT_TYPE_GGTT_PTE;
 		ops->get_entry(NULL, &el_ctx->shadow_entry_backup[i],
-						sl >> GTT_PAGE_SHIFT, false, NULL);
+						sl >> GTT_PAGE_SHIFT, false, vgt);
 
 		{
 			el_ctx->ctx_pages[i].shadow_page.vaddr =

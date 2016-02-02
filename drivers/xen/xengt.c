@@ -159,8 +159,8 @@ static int xen_shutdown_domain(int vm_id)
 	return rc;
 }
 
-static int xen_domain_iomem_perm(uint32_t domain_id, uint64_t first_mfn,
-                               uint64_t nr_mfns, uint8_t allow_access)
+static int xen_domain_iomem_perm(uint32_t domain_id, uint32_t first_mfn,
+                               uint32_t nr_mfns, uint8_t allow_access)
 {
 	struct xen_domctl arg;
 	int rc;
@@ -173,6 +173,23 @@ static int xen_domain_iomem_perm(uint32_t domain_id, uint64_t first_mfn,
 	arg.u.iomem_perm.allow_access = allow_access;
 	rc = HYPERVISOR_domctl(&arg);
 
+	return rc;
+}
+
+/* Mochi: my hypercall, this is for batch memory mapping. */
+static int xen_domain_iomem_perm_batch(uint32_t domain_id, uint64_t *mfns,
+				uint32_t nr_mfns, uint8_t allow_access)
+{
+	struct xen_domctl arg;
+	int rc;
+
+	arg.domain = domain_id;
+	arg.cmd = XEN_DOMCTL_iomem_permission_batch;
+	arg.interface_version = XEN_DOMCTL_INTERFACE_VERSION;
+	arg.u.iomem_perm_batch.mfns = mfns;
+	arg.u.iomem_perm_batch.nr_mfns = nr_mfns;
+	arg.u.iomem_perm_batch.allow_access = allow_access;
+	rc = HYPERVISOR_domctl(&arg);
 	return rc;
 }
 
@@ -212,6 +229,58 @@ static int xen_hvm_memory_mapping(int vm_id, uint64_t first_gfn, uint64_t first_
 		}
 	}
 
+	return rc;
+}
+
+/* Mochi: my hypercall to batch map EPT. */
+static int xen_hvm_memory_batch_mapping(int vm_id, uint64_t *gfns, uint64_t *mfns,
+				  uint32_t nr_mfns, uint32_t add_mapping)
+{
+	struct xen_domctl arg;
+	int rc;
+
+	if (add_mapping) {
+		rc = xen_domain_iomem_perm_batch(vm_id, mfns, nr_mfns, 1);
+	        if (rc < 0) {
+			printk(KERN_ERR "xen_domain_iomem_perm_batch failed: %d\n", rc);
+	        	return rc;
+		}
+	}
+
+	arg.domain = vm_id;
+	arg.cmd = XEN_DOMCTL_memory_batch_mapping;
+	arg.interface_version = XEN_DOMCTL_INTERFACE_VERSION;
+	arg.u.memory_batch_mapping.gfns = gfns;
+	arg.u.memory_batch_mapping.mfns = mfns;
+	arg.u.memory_batch_mapping.nr_mfns = nr_mfns;
+	arg.u.memory_batch_mapping.add_mapping = add_mapping;
+
+	rc = HYPERVISOR_domctl(&arg);
+	if (rc < 0) {
+		printk(KERN_ERR "HYPERVISOR_domctl failed: %d\n", rc);
+		return rc;
+	}
+
+	if (!add_mapping) {
+		rc = xen_domain_iomem_perm_batch(vm_id, mfns, nr_mfns, 0);
+	        if (rc < 0) {
+			printk(KERN_ERR "xen_domain_iomem_perm_batch failed: %d\n", rc);
+			return rc;
+		}
+	}
+
+	return rc;
+}
+
+/* Mochi: my hypercall to batch map pfns.*/
+static int xen_batch_map_mfn_to_gpfn(int vm_id, unsigned long *gpfns, 
+	unsigned long *mfns, int nr, int map, enum map_type type)
+{
+	int rc;
+	rc = xen_hvm_memory_batch_mapping(vm_id, (uint64_t *)gpfns, (uint64_t *)mfns, nr, 
+			map ? DPCI_ADD_MAPPING : DPCI_REMOVE_MAPPING);
+	if (rc != 0)
+		printk("Mochi: xen_hvm_memory_batch_mapping failed: %d\n", rc);
 	return rc;
 }
 
@@ -1157,6 +1226,7 @@ static struct kernel_dm xengt_kdm = {
 	.gpa_to_va = xen_gpa_to_va,
 	.read_va = xen_read_va,
 	.write_va = xen_write_va,
+	.batch_map_mfn_to_gpfn = xen_batch_map_mfn_to_gpfn,	//Mochi: my hpyercall to batch map ept.
 };
 EXPORT_SYMBOL(xengt_kdm);
 

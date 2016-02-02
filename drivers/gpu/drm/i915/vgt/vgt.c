@@ -175,6 +175,9 @@ module_param_named(vgt_preliminary_hw_support, vgt_preliminary_hw_support, bool,
 int shadow_execlist_context = 0;
 module_param_named(shadow_execlist_context, shadow_execlist_context, int, 0400);
 
+int vgt_if_windows = 0;
+module_param_named(vgt_if_windows, vgt_if_windows, int, 0600);
+
 /* Very frequent set/clear write protection can see wrong write trap even if
 + * write protection has been cleared. Below option is to disable the context
 + * protection between ctx submission and ctx completion. Normal context shadow
@@ -433,6 +436,16 @@ bool initial_phys_states(struct pgt_device *pdev)
 	gm_sz(pdev) = pdev->gtt_size >> info->gtt_entry_size_shift << GTT_PAGE_SHIFT;
 
 	ASSERT(gm_sz(pdev) <= info->max_gtt_gm_sz);
+
+	pdev->category_owner[0]=0;	/* Mochi: the default value of each category_owner is 0. */
+	pdev->category_owner[1]=0;
+	pdev->category_owner[2]=0;
+	pdev->category_owner[3]=0;
+
+	pdev->category_load[0]=0;	/* Mochi: the default value of each category_load is 0. */
+	pdev->category_load[1]=0;
+	pdev->category_load[2]=0;
+	pdev->category_load[3]=0;
 
 	pdev->saved_gtt = vzalloc(pdev->gtt_size);
 	if (!pdev->saved_gtt)

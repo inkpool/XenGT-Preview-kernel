@@ -689,12 +689,13 @@ static inline u64 dma_addr_to_pte_uc(struct pgt_device *pdev, dma_addr_t addr)
 
 void init_gm_space(struct pgt_device *pdev)
 {
-	struct vgt_gtt_pte_ops *ops = pdev->gtt.pte_ops;
+	//struct vgt_gtt_pte_ops *ops = pdev->gtt.pte_ops;
 	unsigned long i;
 
 	/* clear all GM space, instead of only aperture */
 	for (i = 0; i < gm_pages(pdev); i++)
-		ops->set_entry(NULL, &pdev->dummy_gtt_entry, i, false, NULL);
+		vgt_write_gtt(pdev, i, pdev->dummy_gtt_entry.val32[0]);
+		//ops->set_entry(NULL, &pdev->dummy_gtt_entry, i, false, NULL);
 
 	vgt_dbg(VGT_DBG_MEM, "content at 0x0: %lx\n",
 			*(unsigned long *)((char *)phys_aperture_vbase(pdev) + 0x0));
@@ -738,13 +739,15 @@ void vgt_clear_gtt(struct vgt_device *vgt)
 	index = vgt_visible_gm_base(vgt) >> PAGE_SHIFT;
 	num_entries = vgt_aperture_sz(vgt) >> PAGE_SHIFT;
 	for (offset = 0; offset < num_entries; offset++){
-		ops->set_entry(NULL, &pdev->dummy_gtt_entry, index+offset, false, NULL);
+		//ops->set_entry(NULL, &pdev->dummy_gtt_entry, index+offset, false, NULL);
+		vgt_write_gtt(pdev, index + offset, pdev->dummy_gtt_entry.val32[0]);
 	}
 
 	index = vgt_hidden_gm_base(vgt) >> PAGE_SHIFT;
 	num_entries = vgt_hidden_gm_sz(vgt) >> PAGE_SHIFT;
 	for (offset = 0; offset < num_entries; offset++){
-		ops->set_entry(NULL, &pdev->dummy_gtt_entry, index+offset, false, NULL);
+		//ops->set_entry(NULL, &pdev->dummy_gtt_entry, index+offset, false, NULL);
+		vgt_write_gtt(pdev, index + offset, pdev->dummy_gtt_entry.val32[0]);
 	}
 }
 
@@ -826,7 +829,8 @@ int setup_gtt(struct pgt_device *pdev)
 		}
 
 		ops->set_pfn(&e, dma_addr >> GTT_PAGE_SHIFT);
-		ops->set_entry(NULL, &e, index + i, false, NULL);
+		vgt_write_gtt(pdev, i + index, e.val32[0]);
+		//ops->set_entry(NULL, &e, index + i, false, NULL);
 
 		if (!(i % 1024))
 			vgt_dbg(VGT_DBG_MEM, "vGT: write GTT-%x phys: %llx, dma: %llx\n",
@@ -969,8 +973,9 @@ int vgt_hvm_map_aperture (struct vgt_device *vgt, int map)
 		bar_s = * (uint32_t*) cfg_space;
 	}
 
-	first_gfn = (bar_s + vgt_aperture_offset(vgt)) >> PAGE_SHIFT;
-	first_mfn = vgt_aperture_base(vgt) >> PAGE_SHIFT;
+	vgt->first_gfn = first_gfn = (bar_s + vgt_aperture_offset(vgt)) >> PAGE_SHIFT;
+	vgt->first_mfn = first_mfn = vgt_aperture_base(vgt) >> PAGE_SHIFT;
+	
 	if (!vgt->ballooning)
 		nr_mfns = vgt->state.bar_size[1] >> PAGE_SHIFT;
 	else

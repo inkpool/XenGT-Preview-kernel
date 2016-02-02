@@ -36,6 +36,9 @@ struct kernel_dm {
 	int (*shutdown_domain)(int vm_id);
 	int (*map_mfn_to_gpfn)(int vm_id, unsigned long gpfn,
 		unsigned long mfn, int nr, int map, enum map_type type);
+	/* Mochi: new function here. */
+	int (*batch_map_mfn_to_gpfn)(int vm_id, unsigned long *gpfns,
+		unsigned long *mfns, int nr, int map, enum map_type type);
 	int (*set_trap_area)(struct vgt_device *vgt, uint64_t start, uint64_t end, bool map);
 	bool (*set_wp_pages)(struct vgt_device *vgt, struct guest_page *p);
 	bool (*unset_wp_pages)(struct vgt_device *vgt, struct guest_page *p);

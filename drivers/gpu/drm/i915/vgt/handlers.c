@@ -93,6 +93,19 @@ static bool fence_mmio_write(struct vgt_device *vgt, unsigned int off,
 	void *p_data, unsigned int bytes)
 {
 	int id;
+	unsigned long value, new_value;
+	unsigned long upper_mask, lower_mask, new_value_mask;	
+	unsigned long gfn, mfn;
+	unsigned long new_upper_pfn, new_lower_pfn, upper_pfn, lower_pfn;
+
+	unsigned long index, gtt_index_start;
+	struct vgt_mm *ggtt_mm = vgt->gtt.ggtt_mm;
+	gtt_entry_t e;
+	struct vgt_gtt_pte_ops *pte_ops = vgt->pdev->gtt.pte_ops;
+
+	unsigned long gfns[100], mfns[100];
+	unsigned long free_page_num, count;
+
 	ASSERT(bytes <= 8 && !(off & (bytes - 1)));
 	id = (off - _REG_FENCE_0_LOW) >> 3;
 
@@ -106,14 +119,114 @@ static bool fence_mmio_write(struct vgt_device *vgt, unsigned int off,
 		memcpy ((char *)vgt->state.sReg + off, p_data, bytes);
 		/* TODO: Check address space */
 
-		/* FENCE registers are physically assigned, update! */
-		if (bytes < 8)
-			VGT_MMIO_WRITE(vgt->pdev, off + vgt->fence_base * 8,
-				__sreg(vgt, off));
-		else
-			VGT_MMIO_WRITE_BYTES(vgt->pdev, off + vgt->fence_base * 8,
-				__sreg64(vgt, off), 8);
-	}
+		if(vgt_if_windows && vgt->vm_id!=0 && (off - 104580)%8==0 && (__vreg64(vgt, off-4)&1)){
+			value = __vreg64(vgt, off - 4);
+			
+			lower_mask = ((1UL << 20)-1) << 12;
+			upper_mask = ((1UL << 20)-1) << 44;
+			lower_pfn = (value & lower_mask) >> 12;
+			upper_pfn = (value & upper_mask) >> 44;
+			vgt_info("Mochi vm: %d off: %d, vReg: %lx, lower_pfn: %lx, upper_pfn: %lx, total: %lx.\n", 
+						vgt->vm_id, off, __vreg64(vgt, off-4), lower_pfn, upper_pfn, upper_pfn - lower_pfn + 1);
+
+			gfn = lower_pfn + (phys_aperture_base(vgt->pdev) >> PAGE_SHIFT) - vgt->first_mfn + vgt->first_gfn;
+			
+			free_page_num = vgt->fence_page_num[id];
+
+			/* Before we map new fence aperture pages, we free old pages. */
+			if(vgt->fence_gfn_start[id]!=0){	
+				//hypervisor_map_mfn_to_gpfn(vgt, vgt->fence_gfn_start[id], vgt->fence_mfn_start[id],
+				//		vgt->fence_page_num[id], 0, VGT_MAP_APERTURE);	//No.1: umap EPT.
+				gtt_index_start = vgt->fence_mfn_start[id] - (phys_aperture_base(vgt->pdev) >> PAGE_SHIFT);
+				for(index = 0; index < free_page_num; index ++){
+					vgt_mm_get_entry(ggtt_mm, NULL, &e, index + gtt_index_start);
+					hypervisor_map_mfn_to_gpfn(vgt, vgt->fence_gfn_start[id] + index, pte_ops->get_pfn(&e),
+						1, 1, VGT_MAP_APERTURE);	//No.2: recover map EPT.
+				}
+				fence_aperture_free(vgt->pdev, vgt->fence_mfn_start[id] << PAGE_SHIFT, vgt->fence_page_num[id] << PAGE_SHIFT);
+			}
+
+			mfn = fence_aperture_alloc(vgt->pdev, (upper_pfn - lower_pfn + 1) << PAGE_SHIFT) >> PAGE_SHIFT;
+			vgt->fence_gfn_start[id] = gfn;
+			vgt->fence_mfn_start[id] = mfn;
+			vgt->fence_page_num[id] = upper_pfn - lower_pfn + 1;
+			hypervisor_map_mfn_to_gpfn(vgt, gfn, mfn, upper_pfn - lower_pfn + 1, 1, VGT_MAP_APERTURE);
+			
+			new_lower_pfn = ((mfn << PAGE_SHIFT) - phys_aperture_base(vgt->pdev)) >> PAGE_SHIFT;
+			new_upper_pfn = new_lower_pfn + upper_pfn - lower_pfn;
+
+			new_value_mask = (((1UL << 12) - 1) << 32) | ((1UL << 12) - 1);
+			new_value = (value & new_value_mask) | (new_lower_pfn << 12) | (new_upper_pfn << 44);
+			for(index = 0; index < (upper_pfn - lower_pfn + 1); index++){
+				vgt_mm_get_entry(ggtt_mm, NULL, &e, lower_pfn + index);
+				vgt_mm_set_entry(ggtt_mm, NULL, &e, new_lower_pfn + index);
+			}
+			
+			VGT_MMIO_WRITE_BYTES(vgt->pdev, off - 4 + vgt->fence_base * 8, new_value, 8);		
+
+		}else if(!vgt_if_windows && vgt->vm_id!=0 && ((off - 1048576)%8==0) && (__vreg64(vgt, off)&1) && (__vreg64(vgt, off) >> 32)){
+			value = __vreg64(vgt, off);
+			
+			lower_mask = ((1UL << 20)-1) << 12;
+			upper_mask = ((1UL << 20)-1) << 44;
+			lower_pfn = (value & lower_mask) >> 12;
+			upper_pfn = (value & upper_mask) >> 44;
+			vgt_info("Mochi vm: %d off: %d, vReg: %lx, lower_pfn: %lx, upper_pfn: %lx, total: %lx.\n", 
+						vgt->vm_id, off, __vreg64(vgt, off), lower_pfn, upper_pfn, upper_pfn - lower_pfn + 1);
+
+			gfn = lower_pfn + (phys_aperture_base(vgt->pdev) >> PAGE_SHIFT) - vgt->first_mfn + vgt->first_gfn;
+
+			free_page_num = vgt->fence_page_num[id];
+			/* Before we map new fence aperture pages, we free old pages. */
+			if(vgt->fence_gfn_start[id]!=0){	
+				//hypervisor_map_mfn_to_gpfn(vgt, vgt->fence_gfn_start[id], vgt->fence_mfn_start[id],
+				//			vgt->fence_page_num[id], 0, VGT_MAP_APERTURE);	//No.1: umap EPT.
+				gtt_index_start = vgt->fence_mfn_start[id] - (phys_aperture_base(vgt->pdev) >> PAGE_SHIFT);
+				count=0;
+				for(index = 0; index < free_page_num; index ++){
+					if(count>99){
+						hypervisor_batch_map_mfn_to_gpfn(vgt, gfns, mfns, 100, 1, VGT_MAP_APERTURE);
+						memset(gfns, 0x0, sizeof(gfns));
+						memset(mfns, 0x0, sizeof(mfns));
+						count = 0;
+					}
+					gfns[count] = vgt->fence_gfn_start[id] + index;
+					vgt_mm_get_entry(ggtt_mm, NULL, &e, index + gtt_index_start);
+					mfns[count] = pte_ops->get_pfn(&e);
+					count++;
+				}
+				hypervisor_batch_map_mfn_to_gpfn(vgt, gfns, mfns, count, 1, VGT_MAP_APERTURE);
+				fence_aperture_free(vgt->pdev, vgt->fence_mfn_start[id] << PAGE_SHIFT, vgt->fence_page_num[id] << PAGE_SHIFT);
+			}
+
+			mfn = fence_aperture_alloc(vgt->pdev, (upper_pfn - lower_pfn + 1) << PAGE_SHIFT) >> PAGE_SHIFT;
+			vgt->fence_gfn_start[id] = gfn;
+			vgt->fence_mfn_start[id] = mfn;
+			vgt->fence_page_num[id] = upper_pfn - lower_pfn + 1;
+			hypervisor_map_mfn_to_gpfn(vgt, gfn, mfn, upper_pfn - lower_pfn + 1, 1, VGT_MAP_APERTURE);
+			
+			new_lower_pfn = ((mfn << PAGE_SHIFT) - phys_aperture_base(vgt->pdev)) >> PAGE_SHIFT;
+			new_upper_pfn = new_lower_pfn + upper_pfn - lower_pfn;
+
+			new_value_mask = (((1UL << 12) - 1) << 32) | ((1UL << 12) - 1);
+			new_value = (value & new_value_mask) | (new_lower_pfn << 12) | (new_upper_pfn << 44);
+			for(index = 0; index < (upper_pfn - lower_pfn + 1); index++){
+				vgt_mm_get_entry(ggtt_mm, NULL, &e, lower_pfn + index);
+				vgt_mm_set_entry(ggtt_mm, NULL, &e, new_lower_pfn + index);
+			}
+			
+			VGT_MMIO_WRITE_BYTES(vgt->pdev, off + vgt->fence_base * 8, new_value, 8);		
+
+		}else{
+			/* FENCE registers are physically assigned, update! */
+			if (bytes < 8)
+				VGT_MMIO_WRITE(vgt->pdev, off + vgt->fence_base * 8,
+					__sreg(vgt, off));
+			else
+				VGT_MMIO_WRITE_BYTES(vgt->pdev, off + vgt->fence_base * 8,
+					__sreg64(vgt, off), 8);
+		}
+	}	
 	return true;
 }
 

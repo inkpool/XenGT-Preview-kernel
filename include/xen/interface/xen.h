@@ -798,6 +798,8 @@ DEFINE_GUEST_HANDLE_STRUCT(xen_domctl_getdomaininfo);
 #define XEN_DOMCTL_memory_mapping                 39
 #define XEN_DOMCTL_iomem_permission               20
 
+#define XEN_DOMCTL_iomem_permission_batch	  666
+#define XEN_DOMCTL_memory_batch_mapping		  888
 
 #define XEN_DOMCTL_vgt_io_trap			  700
 
@@ -839,6 +841,26 @@ struct xen_domctl_iomem_permission {
 typedef struct xen_domctl_iomem_permission xen_domctl_iomem_permission_t;
 DEFINE_GUEST_HANDLE_STRUCT(xen_domctl_iomem_permission_t);
 
+/* Mochi: my batch mapping hyper calls. */
+struct xen_domctl_memory_batch_mapping {
+	aligned_u64 *gfns; /* a group of pages (hvm guest phys page) */
+	aligned_u64 *mfns; /* a group of pages (machine page) */
+	aligned_u64 nr_mfns;   /* number of pages in group (>0) */
+	uint32_t add_mapping;  /* Add or remove mapping */
+	uint32_t padding;      /* padding for 64-bit aligned struct */
+};
+typedef struct xen_domctl_memory_batch_mapping xen_domctl_memory_batch_mapping_t;
+DEFINE_GUEST_HANDLE_STRUCT(xen_domctl_memory_batch_mapping_t);
+
+/* XEN_DOMCTL_iomem_permission */
+struct xen_domctl_iomem_permission_batch {
+    aligned_u64 *mfns;/* a group of pages (physical page number) */
+    aligned_u64 nr_mfns;  /* number of pages in group */
+    uint8_t  allow_access;     /* allow (!0) or deny (0) access to range? */
+};
+typedef struct xen_domctl_iomem_permission_batch xen_domctl_iomem_permission_batch_t;
+DEFINE_GUEST_HANDLE_STRUCT(xen_domctl_iomem_permission_batch_t);
+
 struct xen_domctl {
 	uint32_t cmd;
 	uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
@@ -848,6 +870,8 @@ struct xen_domctl {
 		struct xen_domctl_vgt_io_trap       vgt_io_trap;
 		struct xen_domctl_memory_mapping    memory_mapping;
 		struct xen_domctl_iomem_permission 	iomem_perm;
+		struct xen_domctl_iomem_permission_batch	iomem_perm_batch;	/* Mochi: 2 hypercalls. */
+		struct xen_domctl_memory_batch_mapping		memory_batch_mapping;
 		uint8_t                             pad[256];
 	}u;
 };

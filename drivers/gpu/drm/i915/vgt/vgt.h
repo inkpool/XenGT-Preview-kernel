@@ -97,6 +97,7 @@ extern bool cmd_parser_ip_buf;
 extern bool timer_based_qos;
 extern int tbs_period_ms;
 extern bool opregion_present;
+extern int vgt_if_windows;
 
 enum vgt_event_type {
 	// GT
@@ -294,9 +295,11 @@ struct vgt_rsvd_ring {
 #define VGT_VBLANK_TIMEOUT	50	/* in ms */
 
 /* Maximum VMs supported by vGT. Actual number is device specific */
-#define VGT_MAX_VMS_HSW 		4
-#define VGT_MAX_VMS			8
-#define VGT_RSVD_APERTURE_SZ		(32*SIZE_1MB)	/* reserve 8MB for vGT itself */
+#define VGT_MAX_VMS_HSW 		20
+#define VGT_MAX_VMS			20
+#define VGT_RSVD_APERTURE_SZ		(8*SIZE_1MB)	/* reserve 8MB for vGT itself */
+
+#define VGT_FENCE_APERTURE_SZ		(56*SIZE_1MB)	/* Mochi: fence aperture reserved. */
 
 #define GTT_PAGE_SHIFT		12
 #define GTT_PAGE_SIZE		(1UL << GTT_PAGE_SHIFT)
@@ -312,6 +315,7 @@ struct vgt_rsvd_ring {
 #define VGT_FENCE_BITMAP_BITS	VGT_MAX_NUM_FENCES
 #define VGT_FENCE_REGION_SIZE	(VGT_MAX_NUM_FENCES*8)
 #define VGT_RSVD_APERTURE_BITMAP_BITS (VGT_RSVD_APERTURE_SZ / GTT_PAGE_SIZE)
+#define VGT_FENCE_APERTURE_BITMAP_BITS (VGT_FENCE_APERTURE_SZ / GTT_PAGE_SIZE)	/* Mochi: fence bitmap. */
 #define VGT_APERTURE_PAGES	(VGT_RSVD_APERTURE_SZ >> GTT_PAGE_SHIFT)
 
 //#define SZ_CONTEXT_AREA_PER_RING	4096
@@ -562,6 +566,7 @@ struct vgt_mm {
 	u32 page_table_entry_cnt;
 	void *virtual_page_table;
 	void *shadow_page_table;
+	void *shadow_gtt;	/* Mochi: shadow GTT. */
 
 	int page_table_level;
 	bool has_shadow_page_table;
@@ -956,6 +961,8 @@ struct vgt_device {
 	int			fence_base;
 	int			fence_sz;
 
+	int category;	/* Mochi: this param indicates which category the vm belongs to */
+
 
 	/* TODO: move to hvm_info  */
 	unsigned long low_mem_max_gpfn;	/* the max gpfn of the <4G memory */
@@ -1007,6 +1014,19 @@ struct vgt_device {
 	unsigned long reset_flags;
 	unsigned long enabled_rings_before_reset;
 	unsigned long last_reset_time;
+	
+	/* mochi: for EPT map */
+	unsigned long first_gfn;
+	unsigned long first_mfn;
+	int ept_umap;
+
+	/* Mochi: for fence aperture. */
+	unsigned long fence_gfn_start[4];
+	unsigned long fence_mfn_start[4];
+	unsigned long fence_page_num[4];
+	/* Mochi: for jump over invalid value. */
+	unsigned long invalid;
+	int invalid_count;
 };
 
 enum vgt_owner_type {
@@ -1245,6 +1265,9 @@ struct pgt_device {
 	uint32_t *saved_gtt;
 	uint64_t saved_fences[VGT_MAX_NUM_FENCES];
 
+	int category_owner[4];	/* Mochi: split high GM into 4 categories, each digit of category_owner means the VM_id of current category owner.*/
+	int category_load[4];	/* Mochi: each digit of category_load means the amount of VMs run in this category. */
+
 	uint32_t saved_rrmr;
 	uint32_t saved_shotplug_ctl;
 
@@ -1268,12 +1291,19 @@ struct pgt_device {
 	/* 1 bit corresponds to 1 PAGE(4K) in aperture */
 	DECLARE_BITMAP(rsvd_aperture_bitmap, VGT_RSVD_APERTURE_BITMAP_BITS);
 
+	/* 1 bit corresponds to 1 PAGE(4K) in aperture */
+	DECLARE_BITMAP(fence_aperture_bitmap, VGT_FENCE_APERTURE_BITMAP_BITS);
+
 	struct page *dummy_page;
 	struct page *(*rsvd_aperture_pages)[VGT_APERTURE_PAGES];
 	gtt_entry_t dummy_gtt_entry;
 
 	uint64_t rsvd_aperture_sz;
 	uint64_t rsvd_aperture_base;
+	
+	uint64_t fence_aperture_sz;	/* Mochi: for fence aperture. */
+	uint64_t fence_aperture_base;
+
 	uint64_t scratch_page;		/* page used for data written from GPU */
 
 	struct vgt_device *device[VGT_MAX_VMS];	/* a list of running VMs */
@@ -2042,6 +2072,18 @@ extern unsigned long rsvd_aperture_alloc(struct pgt_device *pdev,
 extern void rsvd_aperture_free(struct pgt_device *pdev, unsigned long start,
 		unsigned long size);
 
+/* Mochi: fence aperture alloc & free fucntions. */
+extern unsigned long fence_aperture_alloc(struct pgt_device *pdev,
+		unsigned long size);
+extern void fence_aperture_free(struct pgt_device *pdev, unsigned long start,
+		unsigned long size);
+
+/* Mochi: new functins to support shadow GTT. */
+extern int switch_gtt_aperture(struct pgt_device *pdev, struct vgt_device *vgt);
+extern int switch_gtt_hidden(struct pgt_device *pdev, struct vgt_device *vgt);
+extern unsigned long get_hidden_gm_start(struct pgt_device *pdev, struct vgt_device *vgt);
+extern int  category_sched(struct pgt_device *pdev, struct vgt_device *vgt);
+
 #if 0
 /* This unused function is for non-ballooning case. */
 /*
@@ -2755,6 +2797,11 @@ vgt_reg_t mmio_g2h_gmadr(struct vgt_device *vgt, unsigned long reg, vgt_reg_t g_
 vgt_reg_t mmio_h2g_gmadr(struct vgt_device *vgt, unsigned long reg, vgt_reg_t h_value);
 unsigned long rsvd_aperture_alloc(struct pgt_device *pdev, unsigned long size);
 void rsvd_aperture_free(struct pgt_device *pdev, unsigned long start, unsigned long size);
+/* Mochi: fence aperture functions. */
+unsigned long fence_aperture_alloc(struct pgt_device *pdev, unsigned long size);
+void fence_aperture_free(struct pgt_device *pdev, unsigned long start, unsigned long size);
+void free_fence_aperture(struct vgt_device *vgt);
+
 int allocate_vm_aperture_gm_and_fence(struct vgt_device *vgt, vgt_params_t vp);
 void free_vm_aperture_gm_and_fence(struct vgt_device *vgt);
 int alloc_vm_rsvd_aperture(struct vgt_device *vgt);
@@ -3006,6 +3053,16 @@ static inline int hypervisor_map_mfn_to_gpfn(struct vgt_device *vgt,
 {
 	if (vgt_pkdm && vgt_pkdm->map_mfn_to_gpfn)
 		return vgt_pkdm->map_mfn_to_gpfn(vgt->vm_id, gpfn, mfn, nr, map, type);
+
+	return 0;
+}
+
+/* Mochi: map a group of gfn to gpfn. */
+static inline int hypervisor_batch_map_mfn_to_gpfn(struct vgt_device *vgt,
+	unsigned long *gpfns, unsigned long *mfns, int nr, int map, enum map_type type)
+{
+	if (vgt_pkdm && vgt_pkdm->batch_map_mfn_to_gpfn)
+		return vgt_pkdm->batch_map_mfn_to_gpfn(vgt->vm_id, gpfns, mfns, nr, map, type);
 
 	return 0;
 }

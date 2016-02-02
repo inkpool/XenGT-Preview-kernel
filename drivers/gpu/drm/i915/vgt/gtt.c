@@ -126,17 +126,29 @@ static inline gtt_type_t get_pse_type(gtt_type_t type) {
 /*
  * Per-platform GTT entry routines.
  */
+
+/* Mochi: modify function to support shadow GTT. 
+If the current owner is the VM who is reading the GTT or Dom0, we just let it read the physical GTT.
+If the current owner is ont the VM who is reading the GTT, the entries read will be from shadow GTT. */
 static gtt_entry_t *gtt_get_entry32(void *pt, gtt_entry_t *e,
 		unsigned long index, bool hypervisor_access,
 		struct vgt_device *vgt)
 {
 	struct vgt_device_info *info = &e->pdev->device_info;
+	struct vgt_mm *ggtt_mm = vgt->gtt.ggtt_mm;
+	void *shadow_gtt = ggtt_mm->shadow_gtt;
 
 	ASSERT(info->gtt_entry_size == 4);
 
 	if (!pt) {
-		e->val32[0] = vgt_read_gtt(e->pdev, index);
-		e->val32[1] = 0;
+		if(vgt->vm_id == 0){
+			e->val32[0] = vgt_read_gtt(e->pdev, index);
+			e->val32[1] = 0;
+		}else{
+			/* domU gets its GM entries */
+			e->val32[0] = *((u32 *)shadow_gtt + index);
+			e->val32[1] = 0;
+		}
 	} else {
 		if (!hypervisor_access) {
 			e->val32[0] = *((u32 *)pt + index);
@@ -149,16 +161,68 @@ static gtt_entry_t *gtt_get_entry32(void *pt, gtt_entry_t *e,
 	return e;
 }
 
+/* Mochi: If the domU is not the owner, its GTT modifications will be on shadow GTT. */
 static gtt_entry_t *gtt_set_entry32(void *pt, gtt_entry_t *e,
 		unsigned long index, bool hypervisor_access,
 		struct vgt_device *vgt)
 {
 	struct vgt_device_info *info = &e->pdev->device_info;
+	
+	struct vgt_mm *ggtt_mm = vgt->gtt.ggtt_mm;
+	void *shadow_gtt = ggtt_mm->shadow_gtt;
+	unsigned long hidden_gm_index_start = hidden_gm_base(vgt->pdev) >> GTT_PAGE_SHIFT;
+	unsigned long fence_aperture_index_start = (hidden_gm_base(vgt->pdev) - vgt->pdev->rsvd_aperture_sz - vgt->pdev->fence_aperture_sz) >> GTT_PAGE_SHIFT;
+	
+	unsigned long mfn, target_mfn, target_gfn;
+	struct vgt_gtt_pte_ops *pte_ops = vgt->pdev->gtt.pte_ops;
 
 	ASSERT(info->gtt_entry_size == 4);
+	if (!pt){
+		if(vgt->vm_id == 0)
+			vgt_write_gtt(e->pdev, index, e->val32[0]);
+		else if(current_render_owner(e->pdev)==vgt){
+			/* domU which owns render sets rsvd_aperture and hidden gm entries */
+			vgt_write_gtt(e->pdev, index, e->val32[0]);
+			*((u32 *)shadow_gtt + index) = e->val32[0];	
+		}else{
+			/* domU sets rsvd_aperture entries */
+			if(index < hidden_gm_index_start && index >= fence_aperture_index_start)
+				vgt_write_gtt(e->pdev, index, e->val32[0]);
 
-	if (!pt)
-		vgt_write_gtt(e->pdev, index, e->val32[0]);
+			*((u32 *)shadow_gtt + index) = e->val32[0];
+		}
+		
+		if(vgt->vm_id!=0 && index < fence_aperture_index_start){
+			if(vgt->ept_umap==0){
+				hypervisor_map_mfn_to_gpfn(vgt, vgt->first_gfn, vgt->first_mfn, vgt_aperture_sz(vgt) >> PAGE_SHIFT, 0, VGT_MAP_APERTURE);
+				vgt->ept_umap=1;
+			}
+				
+			/* get target mfn through the GTT entry */
+			target_mfn = pte_ops->get_pfn(e);
+
+			/* this my naive way to jump over invalid value and reduce hypercall. */
+			if(vgt->invalid==target_mfn){
+				vgt->invalid_count++;
+			}else{
+				vgt->invalid = target_mfn;
+				vgt->invalid_count=0;
+			}
+
+			if(vgt->invalid_count>10)
+				return e;
+				
+			/* domU sets aperture entries */
+			/*    |<-     GM address     ->| + |<-     aperture offset    ->| = HPA -> MFN */
+			mfn = ((index << GTT_PAGE_SHIFT) + phys_aperture_base(vgt->pdev)) >> PAGE_SHIFT;
+
+			target_gfn = vgt->first_gfn + mfn - vgt->first_mfn;
+
+			
+			/* modify EPT to map GPA direct to HPA without using GTT. */
+			hypervisor_map_mfn_to_gpfn(vgt, target_gfn, target_mfn, 1, 1, VGT_MAP_APERTURE);
+		}
+	}
 	else {
 		if (!hypervisor_access)
 			*((u32 *)pt + index) = e->val32[0];
@@ -416,7 +480,7 @@ gtt_entry_t *vgt_mm_get_entry(struct vgt_mm *mm,
 			index += mm->pde_base_index;
 	}
 
-	ops->get_entry(page_table, e, index, false, NULL);
+	ops->get_entry(page_table, e, index, false, mm->vgt);
 	ops->test_pse(e);
 
 	return e;
@@ -441,7 +505,7 @@ gtt_entry_t *vgt_mm_set_entry(struct vgt_mm *mm,
 			index += mm->pde_base_index;
 	}
 
-	return ops->set_entry(page_table, e, index, false, NULL);
+	return ops->set_entry(page_table, e, index, false, mm->vgt);
 }
 
 /*
@@ -967,7 +1031,7 @@ static bool vgt_sync_oos_page(struct vgt_device *vgt, oos_page_t *oos_page)
 	old.val64 = new.val64 = 0;
 
 	for (index = 0; index < (GTT_PAGE_SIZE >> info->gtt_entry_size_shift); index++) {
-		ops->get_entry(oos_page->mem, &old, index, false, NULL);
+		ops->get_entry(oos_page->mem, &old, index, false, vgt);
 		ops->get_entry(oos_page->guest_page->vaddr, &new, index, true, vgt);
 
 		if (old.val64 == new.val64)
@@ -980,7 +1044,7 @@ static bool vgt_sync_oos_page(struct vgt_device *vgt, oos_page_t *oos_page)
 		if (!gtt_entry_p2m(vgt, &new, &m))
 			return false;
 
-		ops->set_entry(oos_page->mem, &new, index, false, NULL);
+		ops->set_entry(oos_page->mem, &new, index, false, vgt);
 		ppgtt_set_shadow_entry(spt, &m, index);
 	}
 
@@ -1228,7 +1292,8 @@ static bool ppgtt_handle_guest_write_page_table_bytes(void *gp,
 			/* 1. only GTT_PTE type has oos_page assocaited
 			 * 2. update oos_page according to wp guest page change
 			 */
-			ops->set_entry(gpt->oos_page->mem, &we, index, false, NULL);
+			ops->set_entry(gpt->oos_page->mem, &we, index, false, vgt);
+
 		}
 
 		if (can_do_out_of_sync(gpt)) {
@@ -1238,6 +1303,8 @@ static bool ppgtt_handle_guest_write_page_table_bytes(void *gp,
 			if (!ppgtt_set_guest_page_oos(vgt, gpt)) {
 				/* should not return false since we can handle it*/
 				ppgtt_set_guest_page_sync(vgt, gpt);
+				vgt_info("Mochi debug mark 5.\n");
+
 			}
 		}
 
@@ -1338,6 +1405,13 @@ bool gen7_mm_alloc_page_table(struct vgt_mm *mm)
 			return false;
 		}
 		mm->virtual_page_table = mem;
+		/* Mochi: alloc shadow GTT. */
+		mem = vzalloc(mm->page_table_entry_size);
+		if (!mem) {
+			vgt_err("fail to allocate memory.\n");
+			return false;
+		}
+		mm->shadow_gtt = mem;
 	}
 	return true;
 }
@@ -1531,7 +1605,7 @@ static inline bool ppgtt_get_next_level_entry(struct vgt_mm *mm,
 			ppgtt_get_guest_entry(s, e, index);
 	} else {
 		pt = hypervisor_mfn_to_virt(ops->get_pfn(e));
-		ops->get_entry(pt, e, index, false, NULL);
+		ops->get_entry(pt, e, index, false, mm->vgt);
 		e->type = get_entry_type(get_next_pt_type(e->type));
 	}
 	return true;
@@ -2313,4 +2387,73 @@ bool vgt_handle_guest_write_rootp_in_context(struct execlist_context *el_ctx, in
 	ppgtt_set_rootp_to_ctx(shadow_ctx_state, &shadow_rootp, idx);
 
 	return rc;
+}
+
+int switch_gtt_aperture(struct pgt_device *pdev, struct vgt_device *vgt)
+{
+	struct vgt_mm *ggtt_mm = vgt->gtt.ggtt_mm;
+	unsigned long i;
+	unsigned long aperture_gm_index_start;
+	unsigned long aperture_gm_pages;
+	gtt_entry_t e;
+	
+	aperture_gm_index_start = vgt->aperture_offset >> GTT_PAGE_SHIFT;
+	aperture_gm_pages = vgt->aperture_sz >> GTT_PAGE_SHIFT;
+	for(i = 0; i < aperture_gm_pages; i++){
+		vgt_mm_get_entry(ggtt_mm, ggtt_mm->shadow_gtt, &e, aperture_gm_index_start + i);
+		vgt_write_gtt(pdev, i + aperture_gm_index_start, e.val32[0]);
+	}
+	return 0;	
+}
+
+int switch_gtt_hidden(struct pgt_device *pdev, struct vgt_device *vgt)
+{
+	struct vgt_mm *ggtt_mm = vgt->gtt.ggtt_mm;
+	unsigned long i;
+	unsigned long high_gm_index_start;
+	unsigned long high_gm_pages;
+	gtt_entry_t e;
+	
+	high_gm_index_start = vgt->hidden_gm_offset >> GTT_PAGE_SHIFT;
+	high_gm_pages = (vgt->gm_sz - vgt->aperture_sz) >> GTT_PAGE_SHIFT;
+	for(i = 0; i < high_gm_pages; i++){
+		vgt_mm_get_entry(ggtt_mm, ggtt_mm->shadow_gtt, &e, high_gm_index_start + i);
+		vgt_write_gtt(pdev, i + high_gm_index_start, e.val32[0]);
+	}
+	return 0;
+}
+
+unsigned long get_hidden_gm_start(struct pgt_device *pdev, struct vgt_device *vgt)
+{
+	struct vgt_device_info *info = &pdev->device_info;
+	int category_load = pdev->category_load[0];
+	int i = 0;
+	int category_id = 0;
+	unsigned long hidden_gm_start;
+	unsigned long category_sz, visible_gm_sz, total_gm_sz;
+	for(i=1; i<4; i++){
+		if(pdev->category_load[i]<category_load){
+			category_load = pdev->category_load[i];
+			category_id = i;
+		}
+	}
+	
+	pdev->category_load[category_id]++;
+	vgt->category = category_id;
+
+	total_gm_sz = info->max_gtt_gm_sz/SIZE_1MB;
+	visible_gm_sz = hidden_gm_base(pdev)/SIZE_1MB;
+	category_sz = (total_gm_sz - visible_gm_sz)/4;
+	hidden_gm_start = visible_gm_sz + vgt->category * category_sz;
+	return hidden_gm_start;
+}
+
+int category_sched(struct pgt_device *pdev, struct vgt_device *vgt)	/* Here could add some scheduling policies. Currently we just switch the category owner. */
+{
+	switch_gtt_aperture(pdev, vgt);
+	//if(vgt->vm_id != pdev->category_owner[vgt->category]){
+	switch_gtt_hidden(pdev, vgt);
+	//	pdev->category_owner[vgt->category] = vgt->vm_id;
+	//}
+	return 0;
 }

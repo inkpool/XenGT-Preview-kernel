@@ -215,7 +215,7 @@ int allocate_vm_aperture_gm_and_fence(struct vgt_device *vgt, vgt_params_t vp)
 	ASSERT(vp.fence_sz > 0);
 
 	visable_gm_start = bitmap_find_next_zero_area(gm_bitmap, guard,
-				aperture_search_start, vp.aperture_sz, 0);
+					aperture_search_start, vp.aperture_sz, 0);
 	if (visable_gm_start >= guard)
 		return -ENOMEM;
 
@@ -239,8 +239,12 @@ int allocate_vm_aperture_gm_and_fence(struct vgt_device *vgt, vgt_params_t vp)
 	vgt->fence_sz = vp.fence_sz;
 
 	/* mark the related areas as BUSY. */
-	bitmap_set(gm_bitmap, visable_gm_start, vp.aperture_sz);
-	if (vp.gm_sz > vp.aperture_sz)
+
+	/* mochi: remove visibale_gm allocate for domU. */
+	if(vgt->vm_id==0)
+		bitmap_set(gm_bitmap, visable_gm_start, vp.aperture_sz);
+	/* Mochi: remove the hidden gm balloning for dormU. */
+	if (vp.gm_sz > vp.aperture_sz && vp.vm_id == 0)
 		bitmap_set(gm_bitmap, hidden_gm_start, vp.gm_sz - vp.aperture_sz);
 	bitmap_set(fence_bitmap, fence_base, vp.fence_sz);
 
@@ -347,10 +351,17 @@ void initialize_gm_fence_allocation_bitmaps(struct pgt_device *pdev)
 	pdev->rsvd_aperture_sz = VGT_RSVD_APERTURE_SZ;
 	pdev->rsvd_aperture_base = phys_aperture_base(pdev) + hidden_gm_base(pdev) -
 								pdev->rsvd_aperture_sz;
+	// Mochi: fence_aperture is in front of rsvd_aperture.
+	pdev->fence_aperture_sz = VGT_FENCE_APERTURE_SZ;
+	pdev->fence_aperture_base = phys_aperture_base(pdev) + hidden_gm_base(pdev) -
+								pdev->rsvd_aperture_sz - pdev->fence_aperture_sz;
 
 	// mark the rsvd aperture as not-available.
 	bitmap_set(gm_bitmap, aperture_2_gm(pdev, pdev->rsvd_aperture_base)/SIZE_1MB,
 				pdev->rsvd_aperture_sz/SIZE_1MB);
+
+	bitmap_set(gm_bitmap, aperture_2_gm(pdev, pdev->fence_aperture_base)/SIZE_1MB,
+				pdev->fence_aperture_sz/SIZE_1MB);
 
 	vgt_info("reserved aperture: [0x%llx, 0x%llx)\n",
 			pdev->rsvd_aperture_base,
@@ -365,3 +376,53 @@ void vgt_init_reserved_aperture(struct pgt_device *pdev)
 	printk("scratch page is allocated at gm(0x%llx)\n", pdev->scratch_page);
 	/* reserve the 1st trunk for vGT's general usage */
 }
+
+unsigned long fence_aperture_alloc(struct pgt_device *pdev, unsigned long size)
+{
+	unsigned long start, nr_pages;
+
+	ASSERT(size > 0);
+
+	nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	start = bitmap_find_next_zero_area( pdev->fence_aperture_bitmap,
+			VGT_FENCE_APERTURE_BITMAP_BITS, 0, nr_pages, 0 );
+
+	if (start >= VGT_FENCE_APERTURE_BITMAP_BITS) {
+		vgt_err("Out of memory for reserved aperture allocation "
+				"of size 0x%lx!\n", size);
+		BUG();
+	}
+
+	bitmap_set(pdev->fence_aperture_bitmap, start, nr_pages);
+	vgt_info("bitmap start: %lu, numbers: %lu.\n", start, nr_pages);
+
+	return pdev->fence_aperture_base + (start << PAGE_SHIFT);
+}
+
+/* free pages in reserved aperture */
+void fence_aperture_free(struct pgt_device *pdev, unsigned long start, unsigned long size)
+{
+	unsigned long nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+	if ( (start >= pdev->fence_aperture_base) &&
+			(start + size <= pdev->fence_aperture_base + pdev->fence_aperture_sz) )
+	{
+		bitmap_clear(pdev->fence_aperture_bitmap,
+				(start - pdev->fence_aperture_base)>>PAGE_SHIFT, nr_pages);
+	} else {
+		vgt_err("Out of range parameter for fence_aperture_free(pdev, "
+			"start[0x%lx], size[0x%lx])!\n", start, size);
+	}
+}
+
+void free_fence_aperture(struct vgt_device *vgt)
+{
+	struct pgt_device *pdev = vgt->pdev;
+	int i;
+	for(i=0; i< 4; i++){
+		if(vgt->fence_gfn_start[i]!=0)
+			fence_aperture_free(pdev, vgt->fence_mfn_start[i] << PAGE_SHIFT, vgt->fence_page_num[i] << PAGE_SHIFT);
+			
+	}
+}
+

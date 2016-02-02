@@ -450,6 +450,7 @@ void vgt_release_instance(struct vgt_device *vgt)
 
 	free_vm_aperture_gm_and_fence(vgt);
 	free_vm_rsvd_aperture(vgt);
+	free_fence_aperture(vgt);
 	vfree(vgt->state.vReg);
 	vfree(vgt->state.sReg);
 	vfree(vgt);
